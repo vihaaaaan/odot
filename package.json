@@ -3,15 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "User-isolated todo application layer with Postgres RLS and Neon Auth, independent of HTTP, MCP, and UI.",
+  "description": "User-isolated todo application layer and REST API with Postgres RLS and Neon Auth.",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./api": "./dist/api/index.js"
   },
   "types": "./dist/index.d.ts",
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
+    "dev": "tsx watch src/api/server.ts",
+    "start": "node dist/api/server.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
@@ -19,9 +22,12 @@
     "db:migrate": "tsx scripts/migrate.ts"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "@hono/zod-openapi": "^1.6.3",
     "dotenv": "^18.0.10",
     "drizzle-orm": "^0.45.4",
     "fractional-indexing": "^4.0.0",
+    "hono": "^4.13.23",
     "jose": "^6.2.18",
     "pg": "^8.23.1",
     "zod": "^4.6.7"

@@ -1,6 +1,6 @@
 # odot
 
-A small todo application layer with private per-user data, Postgres row-level security (RLS), and Neon Auth token verification. No frontend, HTTP server, MCP server, or seed data.
+A small todo application layer and authenticated REST API with private per-user data, Postgres row-level security (RLS), and Neon Auth token verification. No frontend, MCP server, interactive login flow, or seed data.
 
 ## Stack and structure
 
@@ -9,14 +9,21 @@ A small todo application layer with private per-user data, Postgres row-level se
 - Zod for runtime input validation, including calls from untyped clients.
 - Neon Auth for managed Google sign-in and `jose` for verifying signed access tokens.
 - String fractional-indexing keys for manual ordering, without floating-point precision loss. Database comparisons explicitly use the `C` collation to match the key generator.
+- Hono for the HTTP adapter and Node server; Zod OpenAPI generates the API contract from the route schemas.
 
-The code is organized by feature, with separate input contracts, services, and database queries. `src/index.ts` is the public entry point. API routes, CLI commands, or MCP tools can call this same application layer later. This package is server-side only: never ship database credentials or this database client in a Chrome extension.
+The code is organized by feature, with separate input contracts, services, and database queries. `src/index.ts` is the application entry point; `src/api/index.ts` is the HTTP adapter. HTTP routes call the existing services, and future CLI commands or MCP tools can do the same. This package is server-side only: never ship database credentials or this database client in a Chrome extension.
 
 ## Code map
 
 ```text
 src/
   index.ts                  Public API: connects the database and feature services
+  api/
+    index.ts                HTTP factory, authentication, limits, CORS, errors, OpenAPI
+    server.ts               Loads environment, starts Node HTTP server, graceful shutdown
+    contracts.ts            HTTP response schemas, parameters, and JSON serialization
+    tasks.ts                Task routes and HTTP query-string conversion
+    tags.ts                 Tag routes
   auth/
     neon.ts                 Verifies Neon Auth JWTs and returns the signed user ID
   db/
@@ -46,6 +53,7 @@ Other project files:
 | --- | --- |
 | `tests/application.test.ts` | Integration tests for tasks, tags, relationships, ordering, and migrations against temporary Postgres |
 | `tests/auth.test.ts` | Signed JWT acceptance/rejection tests with a local mocked JWKS response |
+| `tests/api.test.ts` | HTTP requests through real signed JWT verification, services, and isolated Postgres RLS |
 | `migrations/` | SQL changes and Drizzle migration metadata; committed together |
 | `scripts/migrate.ts` | Migration command; reads `.env` and calls the migration function |
 | `drizzle.config.ts` | Schema and migration paths for migration-generation tooling |
@@ -58,7 +66,7 @@ Other project files:
 ## Architecture and ownership
 
 ```text
-Script now / HTTP or MCP adapter later
+HTTP adapter / script / future MCP adapter
                  |
                  v
        index.ts: createTodoApp
@@ -106,6 +114,9 @@ This is a feature-first application library with a small internal service/query 
 | Change duplicate-tag error handling or tag SQL | `src/tags/queries.ts` |
 | Add a persisted field or constraint | `src/db/schema.ts`, then generate/review a migration and update the relevant feature |
 | Change the supported package exports | `src/index.ts` |
+| Change HTTP routes or query-string parsing | `src/api/tasks.ts` or `src/api/tags.ts` |
+| Change HTTP authentication, errors, CORS, or request limits | `src/api/index.ts` |
+| Change HTTP response shapes or JSON serialization | `src/api/contracts.ts` |
 | Understand or verify observable application behavior | `tests/application.test.ts` |
 
 Add a feature folder for a meaningful application area, not automatically for every table. Add a separate helper file when it owns a named behavior worth finding independently, as ordering does. There is no requirement for every feature to have the same number of files.
@@ -131,7 +142,7 @@ Follow these files in order:
 5. **`src/tasks/queries.ts`: persistence.** `insertTask` expresses the insert using Drizzle; the Postgres driver sends the query to Postgres. The database generates the ID/default timestamps and returns the inserted row. This is a file of ordinary database-query functions, not another product or server.
 6. **Related data, also in `src/tasks/queries.ts`.** `insertTaskTags` inserts relationship rows and `withTags` loads the tags attached to returned tasks. A task can have several tags without storing a separate copy of each tag inside the task row. The service passes its transaction into these calls, so they all use the same transaction rather than independent connections.
 
-If the call succeeds, it returns a task object with an ID, timestamps, and a `tags` array. If validation or a database operation fails, the promise rejects. The service itself does not print a UI message or return an HTTP status; a future adapter will decide how to present that result.
+If the call succeeds, it returns a task object with an ID, timestamps, and a `tags` array. If validation or a database operation fails, the promise rejects. The service itself does not print a UI message or return an HTTP status; the HTTP adapter translates the result or error for network clients.
 
 ## Walkthrough: moving and sorting
 
@@ -207,7 +218,7 @@ try {
 
 Tags are entirely user-created. `app.tags.create({ name, description? })` supports an optional description. Add tags during task creation with `tagIds`, or later through `app.tasks.attachTag(taskId, tagId)` and `detachTag(taskId, tagId)`.
 
-`neonAccessToken` above is the raw JWT obtained after a real Neon Auth sign-in; it is not a Google access token, an email, or an arbitrary user ID. A future network adapter extracts the bearer token and calls `forToken` for each request. Create the application/pool once per backend process and close it on shutdown, not after each request. Do not reuse a user-scoped object as an indefinitely authenticated session.
+`neonAccessToken` above is the raw JWT obtained after a real Neon Auth sign-in; it is not a Google access token, an email, or an arbitrary user ID. The HTTP adapter extracts the bearer token and calls `forToken` for each request. Create the application/pool once per backend process and close it on shutdown, not after each request. Do not reuse a user-scoped object as an indefinitely authenticated session.
 
 For a trusted script that has independently established identity, use `application.forUser(verifiedUserId)`. This method intentionally skips token verification. Never expose it to untrusted request parameters or put database credentials in the extension. There are no root-level `application.tasks` or `application.tags` methods: a user context is always required.
 
@@ -262,7 +273,45 @@ When implementing the extension/front end, use the Neon Auth client to call `sig
 
 Before production, supply your own Google OAuth client ID/secret through Neon, configure Google's callback as `${NEON_AUTH_BASE_URL}/callback/google`, register your real application callback origin in Neon's trusted domains, and disable localhost. Do not put the Google client secret in the extension or source control. The configured provider and JWT verification are ready, but a complete interactive Google login has not been tested without a UI and a real user.
 
-There is still no exposed HTTP or MCP endpoint. A future transport must extract and verify credentials via `forToken`, return appropriate errors, and apply transport-specific controls such as rate limiting. It should reuse these services rather than duplicating authorization rules.
+The HTTP adapter is implemented locally; it is not deployed. There is no MCP endpoint. Before exposing the API publicly, configure HTTPS hosting and deployment-level rate limiting as well as production OAuth settings. No rate limiter or interactive sign-in flow is implemented here.
+
+## REST API
+
+Start the development server with `npm run dev`, or run `npm run build && npm start` for compiled JavaScript. The server loads `.env`, requires `DATABASE_URL` and `NEON_AUTH_BASE_URL`, and defaults to `HOST=127.0.0.1` and `PORT=3000`. Set `HOST=0.0.0.0` when your deployment requires external binding. It does not run migrations automatically. SIGINT/SIGTERM stop accepting requests, drain active requests, and close the database pool, with a ten-second shutdown deadline.
+
+`GET /health` is public process liveness, not a database readiness check. `GET /openapi.json` is the public OpenAPI 3.1 contract, generated from the same route definitions used for validation. These endpoints do not expose user records. Every `/v1/*` data request requires `Authorization: Bearer <Neon Auth JWT>`. There is no user-ID parameter or authentication bypass route.
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| GET, POST | `/v1/tasks` | List or create tasks |
+| GET, PATCH, DELETE | `/v1/tasks/{id}` | Read, update, or delete a task |
+| PUT | `/v1/tasks/{id}/completion` | Complete or reopen using `{ "completed": true }` or `false` |
+| POST | `/v1/tasks/{id}/move` | Move first/last or before/after a target task |
+| PUT, DELETE | `/v1/tasks/{id}/tags/{tagId}` | Attach or detach a tag, with no request body |
+| GET, POST | `/v1/tags` | List or create user-owned tags |
+| GET, PATCH, DELETE | `/v1/tags/{id}` | Read, update, or delete a tag |
+
+JSON bodies reuse `tasks/inputs.ts` and `tags/inputs.ts`; unknown fields are rejected. PATCH requires at least one supported field. Omit a field to keep its value; set `description` or `dueDate` to `null` to clear it. Tag assignment and task completion have their own routes rather than expanding PATCH to accept every operation.
+
+Task list query parameters are `status` (`incomplete`, `completed`, `all`), `sort` (`manual`, `due_date`, `important`), `important` (`true` or `false`), repeated `tagIds`, `limit` (1–500), and `offset` (0 or greater). Defaults remain incomplete tasks, manual sort, limit 100, offset 0. All requested tags must match. For example: `/v1/tasks?sort=due_date&important=false&tagIds=UUID&tagIds=UUID`. Sorting never rewrites saved order. List responses are JSON arrays; task pagination is offset-based, without a total-count query.
+
+```sh
+export ODOT_TOKEN='your-neon-auth-jwt'
+curl http://127.0.0.1:3000/v1/tasks \
+  -H "Authorization: Bearer $ODOT_TOKEN"
+curl http://127.0.0.1:3000/v1/tasks \
+  -H "Authorization: Bearer $ODOT_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Review API","important":true,"dueDate":"2026-12-01"}'
+```
+
+Create returns 201 and a `Location` header. Reads and updates return 200; deletes and tag assignment return 204 with no body. Create/get/list task responses include `tags`; update/completion/move responses return task fields only. Responses omit internal `userId` fields, serialize timestamps as UTC ISO strings, and preserve date-only due dates as `YYYY-MM-DD`. Treat `orderKey` as opaque and change order only through the move operation.
+
+Errors use `{ "error": { "code": "...", "message": "...", "details": [{ "path": "name", "message": "..." }] } }`; `details` appears only on validation errors. Status codes are 400 for invalid inputs or malformed JSON, 401 for authentication, 404 for missing resources (including other users' IDs), 409 for conflicts, 413 for bodies over 256 KiB, 415 for unsupported content types, and 500 for unexpected errors. Internal errors are logged server-side but not returned to clients. Responses are non-cacheable and include security headers. CORS is disabled by default; set `CORS_ORIGINS` to a comma-separated explicit origin allowlist when the extension/web client exists. CORS permits browser access but never replaces bearer authentication; preflight requests do not require a token when CORS is configured. Wildcard and `null` origins are not allowed. No cookie authentication is used.
+
+For another server host or tests, import `createApi` from `odot/api` and pass the existing `application`. It exposes a Fetch-compatible `api.fetch` and an in-process `api.request` test helper without opening a network port. The separate `server.ts` is the executable entry point. Do not import it into tests or other adapters because importing it starts a listener.
+
+The dependency direction remains `HTTP routes → application services → database`, never the reverse. A future co-located MCP adapter can call the same application entry point; it does not need an HTTP round trip or its own task business logic.
 
 ## Development and verification
 
@@ -273,6 +322,8 @@ npm run build
 ```
 
 Integration tests use the development-only `embedded-postgres` package to start a real, isolated temporary Postgres cluster on a Unix socket. No separately installed Postgres server is required. Run them on macOS or Linux as a non-root user. They apply migrations as an administrator, then exercise services and raw SQL with a separate non-owner `NOBYPASSRLS` runtime login. Tests cover multiple users, guessed IDs, forged ownership, mixed-user foreign keys, no-context access, rollback/commit cleanup, and concurrent pooled requests. They stop/remove the cluster afterward and do not use `.env`, your application database, or Neon. Auth tests sign real local Ed25519 JWTs and mock only the JWKS HTTP response, not persistence or signature verification.
+
+The API suite uses its own temporary Postgres cluster, a restricted runtime login, and locally signed Ed25519 JWTs. Only JWKS fetching is mocked. It exercises all 14 data operations through HTTP request/response handling, including tenant isolation, query conversion, sorting/movement, validation, errors, CORS, and the generated OpenAPI contract.
 
 `npm audit` currently reports four moderate development-only findings from Drizzle Kit's legacy esbuild loader. Production dependencies pass `npm audit --omit=dev`. The loader is only used by local schema-generation tooling; this project does not run an esbuild development server.
 
